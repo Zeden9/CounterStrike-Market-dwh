@@ -1,3 +1,4 @@
+-- 1. Dimension Tables (No external dependencies)
 CREATE TABLE Dim_Time (
     date_id DATE PRIMARY KEY,
     day INT,
@@ -6,25 +7,25 @@ CREATE TABLE Dim_Time (
 );
 
 CREATE TABLE Dim_Skin (
-    skin_id INT PRIMARY KEY,
+    skin_id SERIAL PRIMARY KEY, -- Automatically handles SEQUENCE and DEFAULT
     skin_name VARCHAR(255),
     rarity VARCHAR(50)
 );
 
 CREATE TABLE Dim_Sticker (
-    sticker_id INT PRIMARY KEY,
+    sticker_id SERIAL PRIMARY KEY,
     sticker_name VARCHAR(255),
     rarity VARCHAR(50)
 );
 
 CREATE TABLE Dim_Weapon (
-    weapon_id INT PRIMARY KEY,
+    weapon_id SERIAL PRIMARY KEY,
     weapon_name VARCHAR(255),
     weapon_type VARCHAR(100)
 );
 
 CREATE TABLE Dim_Container (
-    container_id INT PRIMARY KEY,
+    container_id SERIAL PRIMARY KEY,
     container_name VARCHAR(255),
     container_price FLOAT,
     release_date TIMESTAMP,
@@ -32,12 +33,28 @@ CREATE TABLE Dim_Container (
 );
 
 CREATE TABLE Dim_Team (
-    team_id INT PRIMARY KEY,
+    team_id SERIAL PRIMARY KEY,
     team_name VARCHAR(255)
 );
 
+CREATE TABLE Dim_Price_range (
+    price_range_id SERIAL PRIMARY KEY,
+    price_range VARCHAR(50)
+);
+
+CREATE TABLE Dim_Wear_range (
+    wear_range_id SERIAL PRIMARY KEY,
+    wear_range VARCHAR(50)
+);
+
+CREATE TABLE Dim_ItemType (
+    item_type_id SERIAL PRIMARY KEY,
+    item_type VARCHAR(10)
+);
+
+-- 2. Dependent Dimension Tables (Contains Foreign Keys)
 CREATE TABLE Dim_MatchOutcome (
-    match_id INT PRIMARY KEY,
+    match_id SERIAL PRIMARY KEY,
     match_date DATE,
     winner_team INT,
     loser_team INT,
@@ -45,23 +62,7 @@ CREATE TABLE Dim_MatchOutcome (
     FOREIGN KEY (loser_team) REFERENCES Dim_Team(team_id)
 );
 
-
-CREATE TABLE Dim_Price_range (
-    price_range_id INT PRIMARY KEY,
-    price_range VARCHAR(50)
-);
-
-
-CREATE TABLE Dim_Wear_range (
-    wear_range_id INT PRIMARY KEY,
-    wear_range VARCHAR(50)
-);
-
-CREATE TABLE Dim_ItemType (
-    item_type_id INT PRIMARY KEY,
-    item_type VARCHAR(10)
-);
-
+-- 3. Central Fact Table
 CREATE TABLE Fact_MarketPrice (
     fact_id SERIAL PRIMARY KEY,
     item_type INT,
@@ -76,6 +77,8 @@ CREATE TABLE Fact_MarketPrice (
     wear_range_id INT,
     price_range_id INT,
     weapon_id INT,
+    
+    -- Foreign Key Constraints
     FOREIGN KEY (date_id) REFERENCES Dim_Time(date_id),
     FOREIGN KEY (sticker_id) REFERENCES Dim_Sticker(sticker_id),
     FOREIGN KEY (team_id) REFERENCES Dim_Team(team_id),
@@ -87,7 +90,7 @@ CREATE TABLE Fact_MarketPrice (
     FOREIGN KEY (weapon_id) REFERENCES Dim_Weapon(weapon_id),
     FOREIGN KEY (item_type) REFERENCES Dim_ItemType(item_type_id),
 
-    
+    -- Business Rule: Fact record must belong to exactly one structural item category
     CHECK (
         (
             CASE WHEN skin_id IS NOT NULL THEN 1 ELSE 0 END +
