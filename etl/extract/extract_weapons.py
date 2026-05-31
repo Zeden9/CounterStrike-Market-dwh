@@ -2,24 +2,49 @@ import pandas as pd
 from typing import List, Tuple, Optional
 
 
-def load_weapons(weapons_path: str = "data/raw/weapons.txt") -> List[Tuple[List[str], str]]:
-    """Load weapons and their types.
-    
+def load_weapons(weapons_csv_path: str = "data/processed/from_market_data/weapons.csv",
+                 knives_csv_path: str = "data/processed/from_market_data/knives.csv",
+                 weapons_taxonomy_path: str = "data/raw/weapons.txt") -> List[Tuple[List[str], str]]:
+    """Load weapons and knives from market data CSVs with type info from taxonomy.
+
     Returns a list of tuples: (weapon_tokens, weapon_type)
     """
-    weapons = []
-    with open(weapons_path, "r", encoding="utf-8") as f:
+    # Load taxonomy for weapon types
+    taxonomy = {}
+    with open(weapons_taxonomy_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            # Split by comma: "Desert Eagle, Pistol"
             parts = line.split(",")
             if len(parts) == 2:
                 weapon_name = parts[0].strip()
                 weapon_type = parts[1].strip()
-                weapon_tokens = weapon_name.split()
-                weapons.append((weapon_tokens, weapon_type))
+                taxonomy[weapon_name] = weapon_type
+
+    weapons = []
+    seen_weapons = set()
+
+    # Load weapons from weapons.csv
+    weapons_df = pd.read_csv(weapons_csv_path)
+    for weapon_name in weapons_df["weapon"].unique():
+        weapon_name = weapon_name.strip()
+        if weapon_name not in seen_weapons:
+            weapon_type = taxonomy.get(weapon_name, "Weapon")
+            weapon_tokens = weapon_name.split()
+            weapons.append((weapon_tokens, weapon_type))
+            seen_weapons.add(weapon_name)
+
+    # Load knives from knives.csv
+    knives_df = pd.read_csv(knives_csv_path)
+    for weapon_name in knives_df["weapon"].unique():
+        weapon_name = weapon_name.strip()
+        if weapon_name not in seen_weapons:
+            weapon_type = taxonomy.get(weapon_name, "Knife")
+            weapon_tokens = weapon_name.split()
+            weapons.append((weapon_tokens, weapon_type))
+            seen_weapons.add(weapon_name)
+
     # Sort by length of weapon tokens in reverse (longest first)
     weapons.sort(key=lambda x: len(x[0]), reverse=True)
     return weapons
@@ -36,12 +61,14 @@ def find_weapon(tokens: List[str], weapons: List[Tuple[List[str], str]]) -> Tupl
     return None, 0, None
 
 
-def extract_weapons(weapons_path: str = "data/raw/weapons.txt", skin_list_path: str = "data/raw/skin_list.txt") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Extract weapons from skin list.
-    
+def extract_weapons(weapons_csv_path: str = "data/processed/from_market_data/weapons.csv",
+                    knives_csv_path: str = "data/processed/from_market_data/knives.csv",
+                    skin_list_path: str = "data/raw/skin_list.txt") -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Extract weapons from skin list using weapons/knives from market data CSVs.
+
     Returns: (skins_df, unknown_skins_df)
     """
-    weapons = load_weapons(weapons_path)
+    weapons = load_weapons(weapons_csv_path, knives_csv_path)
     weapons_dicts = []
     unknown_skins_dicts = []
 
