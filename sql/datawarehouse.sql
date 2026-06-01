@@ -9,7 +9,13 @@ CREATE TABLE Dim_Time (
 CREATE TABLE Dim_Skin (
     skin_id SERIAL PRIMARY KEY, -- Automatically handles SEQUENCE and DEFAULT
     skin_name VARCHAR(255),
-    rarity VARCHAR(50)
+    rarity VARCHAR(50),
+    addon INT,    
+);
+
+CREATE TABLE Dim_Skin_Addon (
+    addon_id SERIAL PRIMARY KEY,
+    addon_name VARCHAR(50),
 );
 
 CREATE TABLE Dim_Sticker (
@@ -21,7 +27,7 @@ CREATE TABLE Dim_Sticker (
 CREATE TABLE Dim_Weapon (
     weapon_id SERIAL PRIMARY KEY,
     weapon_name VARCHAR(255),
-    weapon_type VARCHAR(100)
+    weapon_type VARCHAR(100),
 );
 
 CREATE TABLE Dim_Container (
@@ -89,6 +95,7 @@ CREATE TABLE Fact_MarketPrice (
     FOREIGN KEY (price_range_id) REFERENCES Dim_Price_range(price_range_id),
     FOREIGN KEY (weapon_id) REFERENCES Dim_Weapon(weapon_id),
     FOREIGN KEY (item_type) REFERENCES Dim_ItemType(item_type_id),
+    FOREIGN KEY (addon) REFERENCES Dim_Skin_Addon(addon_id),
 
     -- Business Rule: Fact record must belong to exactly one structural item category
     CHECK (
