@@ -365,6 +365,12 @@ def load_facts(conn, skins_df: pd.DataFrame, price_frames: List[pd.DataFrame], p
     price_all = pd.concat(price_frames, ignore_index=True)
     logger.info(f"[fact_marketprice] Total price records: {len(price_all)}")
 
+    # Save null weapons to CSV before filtering
+    null_weapons = price_all[price_all["weapon_name"].isna()].copy()
+    if not null_weapons.empty:
+        null_weapons.to_csv("null_weapons_load.csv", index=False)
+        logger.info(f"[fact_marketprice] Saved {len(null_weapons)} rows with null weapons to null_weapons_load.csv")
+
     # Filter out rows with missing weapon_name (from example file, etc.)
     price_all = price_all[price_all["weapon_name"].notna()].copy()
     logger.info(f"[fact_marketprice] After filtering NULL weapons: {len(price_all)}")
@@ -374,18 +380,11 @@ def load_facts(conn, skins_df: pd.DataFrame, price_frames: List[pd.DataFrame], p
 
     price_all["date_parsed"] = _normalize_market_date(price_all["date"])
 
-    # Keep latest price per weapon-skin-wear combination
-    price_latest = (
-        price_all.sort_values("date_parsed", na_position="last")
-        .groupby(["weapon_name", "skin_name", "wear"], dropna=False)
-        .tail(1)
-        .reset_index(drop=True)
-    )
-    logger.info(f"[fact_marketprice] After latest price filter: {len(price_latest)}")
+    # Remove ★ prefix from knife names
+    price_all["weapon_name"] = price_all["weapon_name"].str.replace("★ ", "", regex=False)
 
-    if price_latest.empty:
-        logger.warning("No price data to load after filtering.")
-        return 0
+    # Use all prices (latest price filter removed)
+    price_latest = price_all
 
     # Fetch dimension IDs
     with conn.cursor() as cur:
@@ -463,6 +462,65 @@ def load_facts(conn, skins_df: pd.DataFrame, price_frames: List[pd.DataFrame], p
 
     return len(facts_final)
 
+def save_facts_to_csv(skins_df, price_frames, price_range_dim, output_path="data/processed/facts.csv"):
+    """Build the fact DataFrame and write to CSV without touching the DB."""
+    if not price_frames or all(df.empty for df in price_frames):
+        logger.warning("No price data to save.")
+        return None
+
+    price_all = pd.concat(price_frames, ignore_index=True)
+    price_all = price_all[price_all["weapon_name"].notna()].copy()
+    price_all["date_parsed"] = _normalize_market_date(price_all["date"])
+    
+    # Remove ★ prefix from knife names
+    price_all["weapon_name"] = price_all["weapon_name"].str.replace("★ ", "", regex=False)
+
+    # Vectorized price range mapping (replaces slow apply loop)
+    def map_price_ranges_vectorized(prices, ranges_df):
+        result = pd.Series(pd.NA, index=prices.index)
+        for _, row in ranges_df.iterrows():
+            mask = (prices >= row["min_price"]) & (prices < row["max_price"])
+            result[mask] = row["price_range_id"]
+        return result
+
+    price_all["price_range_id"] = map_price_ranges_vectorized(price_all["price"], price_range_dim)
+    price_all["date_id"] = price_all["date_parsed"].dt.date
+
+    # Build weapon dimension from price data
+    all_weapons = price_all["weapon_name"].dropna().astype(str)
+    weapon_names = sorted(all_weapons.unique())
+    weapons_ref = pd.DataFrame({"weapon_name": weapon_names})
+    weapons_ref["weapon_id"] = weapons_ref.index + 1
+
+    # Build skin dimension from skins_df
+    skins_ref = skins_df[["skin_name", "rarity"]].drop_duplicates()
+    skins_ref["skin_id"] = skins_ref.index + 1
+
+    # Join with weapons
+    facts = price_all.merge(weapons_ref[["weapon_id", "weapon_name"]], on="weapon_name", how="left")
+    
+    # Join with skins
+    facts = facts.merge(skins_ref[["skin_id", "skin_name"]], on="skin_name", how="left")
+
+    # Keep only rows where both skin and weapon matched
+    facts = facts[facts["skin_id"].notna() & facts["weapon_id"].notna()].copy()
+
+    if facts.empty:
+        logger.warning("No matches between price data and dimensions.")
+        return None
+
+    facts_final = facts[["price", "quantity", "date_id", "skin_id", "weapon_id",
+                          "wear", "price_range_id"]].copy()
+    facts_final.columns = ["price", "volume", "date_id", "skin_id", "weapon_id",
+                            "wear", "price_range_id"]
+    facts_final["container_id"] = None
+    facts_final["sticker_id"] = None
+    facts_final["team_id"] = None
+    facts_final["match_id"] = None
+
+    facts_final.to_csv(output_path, index=False)
+    logger.info(f"Saved {len(facts_final)} fact rows to {output_path}")
+    return output_path
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -494,7 +552,9 @@ def load_prices_dimensions(
         load_times(conn, times_dim_df)
         load_wear_ranges(conn, wear_dim_df)
         load_price_ranges(conn, price_range_dim_df)
-        load_facts(conn, skins_df, price_frames, price_range_dim_df)
+        #load_facts(conn, skins_df, price_frames, price_range_dim_df)
+        save_facts_to_csv(skins_df, price_frames, price_range_dim_df)
+
     finally:
         conn.close()
         logger.info("Database connection closed.")
