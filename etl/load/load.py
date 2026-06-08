@@ -9,8 +9,17 @@ Strategy: INSERT … ON CONFLICT DO NOTHING
   - Idempotent: safe to re-run without duplicating rows.
   - Relies on a UNIQUE constraint on the name column of each dim table
     (see add_unique_constraints.sql if not already present).
+
+Performance notes:
+  - Dimension builds run in parallel (ThreadPoolExecutor) where independent.
+  - CSV saves run in parallel (ThreadPoolExecutor) — I/O bound, threads help.
+  - Price-range bucketing uses pd.cut (vectorized) instead of row-by-row loops.
+  - CSV saving is isolated in save_all_csvs() — comment out the call to skip it.
 """
 
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
 import os
@@ -32,21 +41,45 @@ logger = get_logger(__name__)
 
 CSV_OUT_DIR = Path("data/processed/to_csv")
 
-# Canonical item types — order is stable, NULL/standard item is represented as None in data
+# Canonical item types — NULL/standard item is represented as None in data
 # but stored as "Standard" in the dimension so every fact row has a non-null FK.
 ITEM_TYPES = ["Standard", "StatTrak", "Souvenir"]
 
 
 # ---------------------------------------------------------------------------
-# CSV save helper
+# CSV save helpers  —  call save_all_csvs() or comment it out entirely
 # ---------------------------------------------------------------------------
 
 def _save_csv(df: pd.DataFrame, name: str) -> None:
-    """Write df to data/processed/to_csv/<name>.csv."""
+    """Write df to data/processed/to_csv/<name>.csv (single file)."""
     CSV_OUT_DIR.mkdir(parents=True, exist_ok=True)
     path = CSV_OUT_DIR / f"{name}.csv"
     df.to_csv(path, index=False)
-    logger.info(f"[csv] Saved {len(df)} rows to {path}")
+    logger.info(f"[csv] Saved {len(df)} rows → {path}")
+
+
+def save_all_csvs(named_frames: Dict[str, pd.DataFrame]) -> None:
+    """Save all DataFrames to CSV in parallel.
+
+    Pass a dict of {logical_name: df}.  Writes are parallelised with threads
+    (I/O-bound) so large saves don't block each other.
+
+    To skip CSV output entirely, just comment out the call to this function
+    in load_prices_dimensions() / load_all().
+    """
+    CSV_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(max_workers=min(8, len(named_frames))) as pool:
+        futures = {
+            pool.submit(_save_csv, df, name): name
+            for name, df in named_frames.items()
+            if df is not None and not df.empty
+        }
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                fut.result()
+            except Exception as exc:
+                logger.error(f"[csv] Failed to save '{name}': {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -117,10 +150,8 @@ def _insert_dimension(
 ) -> int:
     """Bulk-insert rows from df into `table`, skipping duplicates.
 
-    Uses `ON CONFLICT (column) DO NOTHING` when the column has a unique/PK
-    constraint, which does not require knowing the constraint name.
-    Falls back to row-by-row existence checks for tables without a constraint
-    (rare, but handled gracefully).
+    Uses ON CONFLICT (column) DO NOTHING when the column has a unique/PK
+    constraint.  Falls back to row-by-row existence checks otherwise.
 
     Returns total row count in the table after insert.
     """
@@ -140,7 +171,6 @@ def _insert_dimension(
             execute_values(cur, sql, rows, page_size=1000)
             conn.commit()
     else:
-        # No unique constraint — insert only rows not already present
         logger.warning(
             f"[{table}] No unique/PK constraint on '{conflict_column}'. "
             "Using row-by-row existence checks (consider adding a constraint)."
@@ -181,7 +211,6 @@ def _insert_dimension(
 # ---------------------------------------------------------------------------
 
 def _build_item_type_dim() -> pd.DataFrame:
-    """Build Dim_ItemType with the three canonical values."""
     return pd.DataFrame({"item_type": ITEM_TYPES})
 
 
@@ -191,7 +220,6 @@ def load_item_types(conn, df: pd.DataFrame) -> int:
 
 
 def _fetch_item_type_map(conn) -> Dict[str, int]:
-    """Return {item_type_label: item_type_id} from the DB."""
     with conn.cursor() as cur:
         cur.execute('SELECT item_type_id, item_type FROM "dim_itemtype"')
         return {row[1]: row[0] for row in cur.fetchall()}
@@ -212,7 +240,6 @@ def _build_skin_dim(
     skins_df: pd.DataFrame,
     price_frames: Optional[List[pd.DataFrame]] = None,
 ) -> pd.DataFrame:
-    """Build dim_skin from skins.csv plus any skin names seen in price frames."""
     base = skins_df[["skin_name", "rarity"]].drop_duplicates()
 
     if price_frames:
@@ -240,7 +267,6 @@ def _build_weapon_dim(
     taxonomy: Dict[str, str],
     knives_csv_path: str = "data/processed/from_market_data/knives.csv",
 ) -> pd.DataFrame:
-    """Build dim_weapon including knives, with correct weapon_type from taxonomy."""
     all_weapon_names: pd.Series = pd.concat(
         [df["weapon_name"] for df in price_frames if "weapon_name" in df.columns],
         ignore_index=True,
@@ -253,18 +279,15 @@ def _build_weapon_dim(
     if knives_path.exists():
         knives_df = pd.read_csv(knives_path)
         knife_names = knives_df["weapon"].str.strip().dropna().unique()
-        knives_frame = pd.DataFrame({"weapon_name": knife_names})
         weapons_df = (
-            pd.concat([weapons_df, knives_frame], ignore_index=True)
+            pd.concat([weapons_df, pd.DataFrame({"weapon_name": knife_names})], ignore_index=True)
             .drop_duplicates(subset="weapon_name")
         )
     else:
         logger.warning(f"Knives CSV not found at {knives_csv_path}; knives skipped from dim_weapon.")
 
     weapons_df = weapons_df.sort_values("weapon_name").reset_index(drop=True)
-    weapons_df["weapon_type"] = weapons_df["weapon_name"].map(taxonomy)
-    weapons_df["weapon_type"] = weapons_df["weapon_type"].fillna("Unknown")
-
+    weapons_df["weapon_type"] = weapons_df["weapon_name"].map(taxonomy).fillna("Unknown")
     return weapons_df[["weapon_name", "weapon_type"]]
 
 
@@ -291,7 +314,7 @@ def _build_time_dim(price_frames: List[pd.DataFrame]) -> pd.DataFrame:
 
 
 def _build_wear_dim(price_frames: List[pd.DataFrame]) -> pd.DataFrame:
-    wear_conditions = set()
+    wear_conditions: set = set()
     for df in price_frames:
         if "wear" in df.columns:
             wear_conditions.update(df["wear"].dropna().unique())
@@ -378,140 +401,192 @@ def _build_containers(
 # Fact builder
 # ---------------------------------------------------------------------------
 
-def _build_facts(
+def _assign_price_range_vectorized(
+    prices: pd.Series,
+    price_range_db: pd.DataFrame,
+) -> pd.Series:
+    """Vectorized price-range bucketing using pd.cut — much faster than row iteration."""
+    pr = price_range_db.sort_values("min_price").reset_index(drop=True)
+    bins   = list(pr["min_price"]) + [float("inf")]
+    labels = list(pr["price_range_id"].astype(int))
+    return pd.cut(
+        prices,
+        bins=bins,
+        labels=labels,
+        right=False,
+        include_lowest=True,
+    ).astype(object)  # keeps NaN as None-compatible object
+
+
+def _build_type_lookup(
+    weapons_csv_path: str,
+    knives_csv_path: str,
+    gloves_csv_path: str,
+) -> pd.DataFrame:
+    """Build the (weapon_name, skin_name) → type lookup once, before streaming."""
+    type_frames = []
+    for csv_path in (weapons_csv_path, knives_csv_path, gloves_csv_path):
+        p = Path(csv_path)
+        if p.exists():
+            df_csv = pd.read_csv(p)
+            if {"weapon", "skin_name", "type"}.issubset(df_csv.columns):
+                type_frames.append(
+                    df_csv[["weapon", "skin_name", "type"]].rename(columns={"weapon": "weapon_name"})
+                )
+        else:
+            logger.warning(f"[facts] CSV not found for item-type lookup: {csv_path}")
+
+    if not type_frames:
+        return pd.DataFrame(columns=["weapon_name", "skin_name", "type"])
+
+    lookup = (
+        pd.concat(type_frames, ignore_index=True)
+        .drop_duplicates(subset=["weapon_name", "skin_name"])
+    )
+    lookup["type"] = lookup["type"].fillna("Standard")
+    return lookup
+
+
+def _process_chunk(
+    chunk: pd.DataFrame,
+    price_range_db: pd.DataFrame,
+    skins_db: pd.DataFrame,
+    weapons_db: pd.DataFrame,
+    wear_db: pd.DataFrame,
+    item_type_map: Dict[str, int],
+    type_lookup: pd.DataFrame,
+    standard_id: int,
+) -> pd.DataFrame:
+    """Transform one price_frame into fact rows. Returns empty df if nothing matches."""
+    chunk = chunk[chunk["weapon_name"].notna()].copy()
+    if chunk.empty:
+        return pd.DataFrame()
+
+    chunk["date_parsed"] = _normalize_market_date(chunk["date"])
+    chunk["weapon_name"] = chunk["weapon_name"].str.replace("★ ", "", regex=False)
+
+    if not type_lookup.empty:
+        chunk = chunk.merge(type_lookup, on=["weapon_name", "skin_name"], how="left")
+        chunk["type"] = chunk["type"].fillna("Standard")
+    else:
+        chunk["type"] = "Standard"
+
+    chunk["item_type_id"] = chunk["type"].map(item_type_map).fillna(standard_id).astype(int)
+    chunk["price_range_id"] = _assign_price_range_vectorized(chunk["price"], price_range_db)
+    chunk["date_id"] = chunk["date_parsed"].dt.date.where(chunk["date_parsed"].notna(), other=None)
+
+    chunk = (
+        chunk
+        .merge(weapons_db, on="weapon_name", how="left")
+        .merge(skins_db,   on="skin_name",   how="left")
+        .merge(wear_db,    left_on="wear", right_on="wear_range", how="left")
+    )
+    chunk = chunk[chunk["skin_id"].notna() & chunk["weapon_id"].notna()]
+    if chunk.empty:
+        return pd.DataFrame()
+
+    out = chunk[[
+        "price", "quantity", "date_id", "skin_id", "weapon_id",
+        "wear_range_id", "price_range_id", "item_type_id",
+    ]].copy()
+    out.columns = [
+        "price", "volume", "date_id", "skin_id", "weapon_id",
+        "wear_range_id", "price_range_id", "item_type_id",
+    ]
+    out["container_id"] = None
+    out["sticker_id"]   = None
+    out["team_id"]      = None
+    out["match_id"]     = None
+
+    int_fk_cols = ["skin_id", "weapon_id", "wear_range_id", "price_range_id", "item_type_id"]
+    for col in int_fk_cols:
+        out[col] = out[col].apply(lambda x: None if pd.isna(x) else int(x))
+    out["volume"] = out["volume"].apply(lambda x: None if pd.isna(x) else int(x))
+    out["price"]  = out["price"].apply(lambda x: None if pd.isna(x) else float(x))
+
+    return out
+
+
+def load_facts_streaming(
+    conn,
     price_frames: List[pd.DataFrame],
     price_range_db: pd.DataFrame,
     skins_db: pd.DataFrame,
     weapons_db: pd.DataFrame,
     wear_db: pd.DataFrame,
     item_type_map: Dict[str, int],
-    weapons_csv_path: str = "data/processed/from_market_data/weapons.csv",
-    knives_csv_path: str = "data/processed/from_market_data/knives.csv",
-    gloves_csv_path: str = "data/processed/from_market_data/gloves.csv",
-) -> pd.DataFrame:
-    """Build the full fact DataFrame in memory (no DB writes).
+    weapons_csv_path: str,
+    knives_csv_path: str,
+    gloves_csv_path: str,
+    batch_size: int = 50,
+) -> int:
+    """Process price_frames in batches and insert directly — never concatenates
+    the full dataset into memory.
 
-    Resolves item_type_id by joining price rows against the type column in the
-    per-category CSVs produced by extract.py (weapons, knives, gloves).
-    None/null type values in those CSVs map to the "Standard" item type.
+    batch_size controls how many price_frames are merged into one INSERT.
+    50 is a good default; lower it to 10-20 if you still hit memory limits,
+    or raise it to 200 if you have headroom and want fewer DB round-trips.
     """
-    if not price_frames or all(df.empty for df in price_frames):
-        logger.warning("No price data available for fact building.")
-        return pd.DataFrame()
-
-    # ------------------------------------------------------------------
-    # Build a (weapon, skin_name) tp item_type lookup from the three CSVs
-    # that now carry a `type` column (StatTrak / Souvenir / None).
-    # ------------------------------------------------------------------
-    type_frames = []
-    for csv_path in (weapons_csv_path, knives_csv_path, gloves_csv_path):
-        p = Path(csv_path)
-        if p.exists():
-            df_csv = pd.read_csv(p)
-            # Both weapons.csv and knives.csv use "weapon"; gloves.csv also uses "weapon"
-            if "weapon" in df_csv.columns and "skin_name" in df_csv.columns and "type" in df_csv.columns:
-                type_frames.append(df_csv[["weapon", "skin_name", "type"]].rename(columns={"weapon": "weapon_name"}))
-        else:
-            logger.warning(f"[facts] CSV not found for item-type lookup: {csv_path}")
-
-    if type_frames:
-        type_lookup = (
-            pd.concat(type_frames, ignore_index=True)
-            .drop_duplicates(subset=["weapon_name", "skin_name"])
-        )
-        # Normalise: None / NaN tp "Standard"
-        type_lookup["type"] = type_lookup["type"].fillna("Standard")
-    else:
-        type_lookup = pd.DataFrame(columns=["weapon_name", "skin_name", "type"])
-
-    # ------------------------------------------------------------------
-    # Concat all price frames and basic cleanup
-    # ------------------------------------------------------------------
-    price_all = pd.concat(price_frames, ignore_index=True)
-
-    null_weapons = price_all[price_all["weapon_name"].isna()]
-    if not null_weapons.empty:
-        null_path = CSV_OUT_DIR / "null_weapons.csv"
-        CSV_OUT_DIR.mkdir(parents=True, exist_ok=True)
-        null_weapons.to_csv(null_path, index=False)
-        logger.info(f"[facts] Saved {len(null_weapons)} null-weapon rows tp {null_path}")
-
-    price_all = price_all[price_all["weapon_name"].notna()].copy()
-    if price_all.empty:
-        logger.warning("No valid price data after filtering null weapon_names.")
-        return pd.DataFrame()
-
-    price_all["date_parsed"] = _normalize_market_date(price_all["date"])
-    price_all["weapon_name"] = price_all["weapon_name"].str.replace("★ ", "", regex=False)
-
-    # ------------------------------------------------------------------
-    # Resolve item_type_id: join on (weapon_name, skin_name), then map to DB id
-    # ------------------------------------------------------------------
-    if not type_lookup.empty:
-        price_all = price_all.merge(type_lookup, on=["weapon_name", "skin_name"], how="left")
-        price_all["type"] = price_all["type"].fillna("Standard")
-    else:
-        price_all["type"] = "Standard"
-
-    price_all["item_type_id"] = price_all["type"].map(item_type_map)
-    # Any label not in the map (shouldn't happen, but defensive) tp Standard
+    type_lookup = _build_type_lookup(weapons_csv_path, knives_csv_path, gloves_csv_path)
     standard_id = item_type_map.get("Standard")
-    price_all["item_type_id"] = price_all["item_type_id"].fillna(standard_id).apply(
-        lambda x: None if pd.isna(x) else int(x)
-    )
+    total_inserted = 0
 
-    # ------------------------------------------------------------------
-    # Vectorized price range mapping using DB IDs
-    # ------------------------------------------------------------------
-    price_all["price_range_id"] = None
-    for _, pr_row in price_range_db.iterrows():
-        mask = (price_all["price"] >= pr_row["min_price"]) & (
-            price_all["price"] < pr_row["max_price"]
-        )
-        price_all.loc[mask, "price_range_id"] = int(pr_row["price_range_id"])
-
-    price_all["date_id"] = price_all["date_parsed"].dt.date
-
-    facts = (
-        price_all
-        .merge(weapons_db, on="weapon_name", how="left")
-        .merge(skins_db,   on="skin_name",   how="left")
-        .merge(wear_db,    left_on="wear", right_on="wear_range", how="left")
-    )
-    facts = facts[facts["skin_id"].notna() & facts["weapon_id"].notna()].copy()
-
-    if facts.empty:
-        logger.warning("No dimension matches found for fact rows.")
-        return pd.DataFrame()
-
-    facts_final = facts[[
-        "price", "quantity", "date_id", "skin_id", "weapon_id",
-        "wear_range_id", "price_range_id", "item_type_id",
-    ]].copy()
-    facts_final.columns = [
+    columns = [
         "price", "volume", "date_id", "skin_id", "weapon_id",
         "wear_range_id", "price_range_id", "item_type_id",
+        "container_id", "sticker_id", "team_id", "match_id",
     ]
-    facts_final["container_id"] = None
-    facts_final["sticker_id"]   = None
-    facts_final["team_id"]      = None
-    facts_final["match_id"]     = None
+    col_str    = ", ".join(f'"{c}"' for c in columns)
+    insert_sql = f'INSERT INTO "fact_marketprice" ({col_str}) VALUES %s'
 
-    # Convert all nullable integer FK columns to object dtype with Python None
-    int_fk_cols = ["skin_id", "weapon_id", "wear_range_id", "price_range_id", "item_type_id"]
-    for col in int_fk_cols:
-        facts_final[col] = facts_final[col].apply(
-            lambda x: None if pd.isna(x) else int(x)
+    num_batches = (len(price_frames) + batch_size - 1) // batch_size
+    for batch_idx, batch_start in enumerate(range(0, len(price_frames), batch_size), start=1):
+        batch  = price_frames[batch_start : batch_start + batch_size]
+        chunks = [
+            _process_chunk(
+                frame, price_range_db, skins_db, weapons_db, wear_db,
+                item_type_map, type_lookup, standard_id,
+            )
+            for frame in batch
+        ]
+        facts_batch = pd.concat([c for c in chunks if not c.empty], ignore_index=True)
+        if facts_batch.empty:
+            logger.info(f"[fact_marketprice] Batch {batch_idx}/{num_batches} — no rows matched, skipping.")
+            continue
+
+        rows = [tuple(r) for r in facts_batch[columns].itertuples(index=False, name=None)]
+
+        # Drop rows that would violate NOT NULL constraints
+        required = ["date_id", "skin_id", "weapon_id", "price", "item_type_id"]
+        null_mask = facts_batch[required].isnull().any(axis=1)
+        null_rows = facts_batch[null_mask]
+        facts_batch = facts_batch[~null_mask]
+        if not null_rows.empty:
+            null_path = CSV_OUT_DIR / "null_values.csv"
+            CSV_OUT_DIR.mkdir(parents=True, exist_ok=True)
+            null_rows.to_csv(null_path, mode="a", header=not null_path.exists(), index=False)
+            logger.warning(
+                f"[fact_marketprice] Batch {batch_idx}/{num_batches} — "
+                f"dropped {len(null_rows)} rows with nulls, appended to {null_path}"
+            )
+
+        if facts_batch.empty:
+            logger.info(f"[fact_marketprice] Batch {batch_idx}/{num_batches} — all rows dropped, skipping.")
+            continue
+
+        rows = [tuple(r) for r in facts_batch[columns].itertuples(index=False, name=None)]
+        with conn.cursor() as cur:
+            execute_values(cur, insert_sql, rows, page_size=1000)
+        conn.commit()
+
+        total_inserted += len(rows)
+        logger.info(
+            f"[fact_marketprice] Batch {batch_idx}/{num_batches} "
+            f"— inserted {len(rows)} rows (total so far: {total_inserted})"
         )
 
-    facts_final["volume"] = facts_final["volume"].apply(
-        lambda x: None if pd.isna(x) else int(x)
-    )
-    facts_final["price"] = facts_final["price"].apply(
-        lambda x: None if pd.isna(x) else float(x)
-    )
-
-    return facts_final
+    logger.info(f"[fact_marketprice] Streaming load complete. Total rows: {total_inserted}")
+    return total_inserted
 
 
 # ---------------------------------------------------------------------------
@@ -572,35 +647,6 @@ def load_price_ranges(conn, df: pd.DataFrame) -> int:
     return _insert_dimension(conn, "dim_price_range", df, ["price_range"], "price_range")
 
 
-def load_facts(conn, facts_final: pd.DataFrame) -> int:
-    """Insert a pre-built fact DataFrame using batched execute_values."""
-    if facts_final.empty:
-        logger.warning("[fact_marketprice] Empty fact DataFrame – nothing to load.")
-        return 0
-
-    logger.info(f"[fact_marketprice] Loading {len(facts_final)} rows …")
-
-    columns = [
-        "price", "volume", "date_id", "skin_id", "weapon_id",
-        "wear_range_id", "price_range_id", "item_type_id",
-        "container_id", "sticker_id", "team_id", "match_id",
-    ]
-    col_str = ", ".join(f'"{c}"' for c in columns)
-    rows = [tuple(row) for row in facts_final[columns].itertuples(index=False, name=None)]
-
-    with conn.cursor() as cur:
-        execute_values(
-            cur,
-            f'INSERT INTO "fact_marketprice" ({col_str}) VALUES %s',
-            rows,
-            page_size=1000,
-        )
-    conn.commit()
-
-    logger.info(f"[fact_marketprice] Done. {len(facts_final)} rows inserted.")
-    return len(facts_final)
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -622,26 +668,62 @@ def load_prices_dimensions(
         if price_frames is not None
         else extract_prices(max_files=max_price_files)
     )
+    logger.info(f"extract_prices complete — {len(price_frames)} frames loaded.")
 
     taxonomy = load_weapon_taxonomy(weapons_txt_path)
 
-    # Build all dimensions
-    item_type_dim_df = _build_item_type_dim()
-    containers_df    = _build_containers(skins_df, price_frames)
-    weapons_dim_df   = _build_weapon_dim(price_frames, taxonomy, knives_csv_path)
-    times_dim_df     = _build_time_dim(price_frames)
-    wear_dim_df      = _build_wear_dim(price_frames)
-    price_range_df   = _build_price_range_dim()
-    skins_dim_df     = _build_skin_dim(skins_df, price_frames)
+    # ------------------------------------------------------------------
+    # Build independent dimensions in parallel
+    # ------------------------------------------------------------------
+    def _build_weapons():  return _build_weapon_dim(price_frames, taxonomy, knives_csv_path)
+    def _build_times():    return _build_time_dim(price_frames)
+    def _build_wear():     return _build_wear_dim(price_frames)
+    def _build_pr():       return _build_price_range_dim()
+    def _build_skins():    return _build_skin_dim(skins_df, price_frames)
+    def _build_cont():     return _build_containers(skins_df, price_frames)
+    def _build_itype():    return _build_item_type_dim()
 
-    # Save dimension CSVs
-    _save_csv(item_type_dim_df, "dim_itemtype")
-    _save_csv(skins_dim_df,     "dim_skin")
-    _save_csv(weapons_dim_df,   "dim_weapon")
-    _save_csv(containers_df,    "dim_container")
-    _save_csv(times_dim_df,     "dim_time")
-    _save_csv(wear_dim_df,      "dim_wear_range")
-    _save_csv(price_range_df,   "dim_price_range")
+    builders = {
+        "weapons":    _build_weapons,
+        "times":      _build_times,
+        "wear":       _build_wear,
+        "price_range":_build_pr,
+        "skins":      _build_skins,
+        "containers": _build_cont,
+        "item_type":  _build_itype,
+    }
+
+    results: Dict[str, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=len(builders)) as pool:
+        future_map = {pool.submit(fn): key for key, fn in builders.items()}
+        for fut in as_completed(future_map):
+            key = future_map[fut]
+            try:
+                results[key] = fut.result()
+            except Exception as exc:
+                logger.error(f"[build] '{key}' failed: {exc}")
+                raise
+
+    item_type_dim_df = results["item_type"]
+    containers_df    = results["containers"]
+    weapons_dim_df   = results["weapons"]
+    times_dim_df     = results["times"]
+    wear_dim_df      = results["wear"]
+    price_range_df   = results["price_range"]
+    skins_dim_df     = results["skins"]
+
+    # ------------------------------------------------------------------
+    # Save all dimension CSVs in parallel  ← comment this out to skip CSV output
+    # ------------------------------------------------------------------
+    save_all_csvs({
+        "dim_itemtype":  item_type_dim_df,
+        "dim_skin":      skins_dim_df,
+        "dim_weapon":    weapons_dim_df,
+        "dim_container": containers_df,
+        "dim_time":      times_dim_df,
+        "dim_wear_range":wear_dim_df,
+        "dim_price_range":price_range_df,
+    })
 
     if not load_to_db:
         logger.info("load_to_db=False – skipping database inserts.")
@@ -649,16 +731,12 @@ def load_prices_dimensions(
 
     conn = get_connection()
     try:
-        # Seed Dim_ItemType first — facts depend on its IDs
-        #load_item_types(conn, item_type_dim_df)
-
         load_weapons(conn, weapons_dim_df)
         load_containers(conn, containers_df)
         load_times(conn, times_dim_df)
         load_wear_ranges(conn, wear_dim_df)
         load_price_ranges(conn, price_range_df)
 
-        # Read ALL dimension IDs back from DB — Postgres serials are source of truth
         with conn.cursor() as cur:
             cur.execute('SELECT skin_id, skin_name FROM "dim_skin"')
             skins_db = pd.DataFrame(cur.fetchall(), columns=["skin_id", "skin_name"])
@@ -680,13 +758,11 @@ def load_prices_dimensions(
             how="left",
         )
 
-        facts_df = _build_facts(
-            price_frames, price_range_db, skins_db, weapons_db, wear_db,
+        load_facts_streaming(
+            conn, price_frames, price_range_db, skins_db, weapons_db, wear_db,
             item_type_map, weapons_csv_path, knives_csv_path, gloves_csv_path,
+            batch_size=50,
         )
-        if not facts_df.empty:
-            _save_csv(facts_df, "fact_marketprice")
-            load_facts(conn, facts_df)
     finally:
         conn.close()
         logger.info("Database connection closed.")
@@ -726,23 +802,26 @@ def load_all(
 
     conn = get_connection()
     try:
-        # Always seed item types — idempotent due to ON CONFLICT DO NOTHING
         item_type_dim_df = _build_item_type_dim()
-        _save_csv(item_type_dim_df, "dim_itemtype")
-        load_item_types(conn, item_type_dim_df)
-
         skins_dim = _build_skin_dim(transformed["skins"], price_frames)
-        _save_csv(skins_dim, "dim_skin")
+
+        # ← comment out this block to skip CSV output in load_all
+        save_all_csvs({
+            "dim_itemtype": item_type_dim_df,
+            "dim_skin":     skins_dim,
+            **({"dim_weapon": weapons_dim} if not weapons_dim.empty else {}),
+            **({"dim_sticker": transformed["stickers"]} if "stickers" in transformed else {}),
+        })
+
+        load_item_types(conn, item_type_dim_df)
         load_skins(conn, skins_dim)
 
         if not weapons_dim.empty:
-            _save_csv(weapons_dim, "dim_weapon")
             load_weapons(conn, weapons_dim)
         else:
             logger.warning("No weapons dataset available; skipping dim_weapon load.")
 
         if "stickers" in transformed:
-            _save_csv(transformed["stickers"], "dim_sticker")
             load_stickers(conn, transformed["stickers"])
         else:
             logger.warning("No transformed stickers dataset; skipping dim_sticker load.")
