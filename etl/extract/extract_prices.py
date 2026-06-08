@@ -83,7 +83,7 @@ def _load_single_file(args: Tuple[Path, Dict[str, str]]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def extract_prices(
-    market_dir: str = "data/raw/every_5th",
+    market_dir: str = "data/raw/market",
     max_files: Optional[int] = None,
     name_conversion_table_path: str = "data/raw/name_conversion_table.csv",
     workers: int = 8,
@@ -118,7 +118,7 @@ def extract_prices(
 
 
 def extract_prices_df(
-    market_dir: str = "data/raw/every_5th",
+    market_dir: str = "data/raw/market",
     max_files: Optional[int] = None,
     name_conversion_table_path: str = "data/raw/name_conversion_table.csv",
     workers: int = 8,

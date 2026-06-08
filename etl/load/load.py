@@ -46,7 +46,7 @@ def _save_csv(df: pd.DataFrame, name: str) -> None:
     CSV_OUT_DIR.mkdir(parents=True, exist_ok=True)
     path = CSV_OUT_DIR / f"{name}.csv"
     df.to_csv(path, index=False)
-    logger.info(f"[csv] Saved {len(df)} rows → {path}")
+    logger.info(f"[csv] Saved {len(df)} rows to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +400,7 @@ def _build_facts(
         return pd.DataFrame()
 
     # ------------------------------------------------------------------
-    # Build a (weapon, skin_name) → item_type lookup from the three CSVs
+    # Build a (weapon, skin_name) tp item_type lookup from the three CSVs
     # that now carry a `type` column (StatTrak / Souvenir / None).
     # ------------------------------------------------------------------
     type_frames = []
@@ -419,7 +419,7 @@ def _build_facts(
             pd.concat(type_frames, ignore_index=True)
             .drop_duplicates(subset=["weapon_name", "skin_name"])
         )
-        # Normalise: None / NaN → "Standard"
+        # Normalise: None / NaN tp "Standard"
         type_lookup["type"] = type_lookup["type"].fillna("Standard")
     else:
         type_lookup = pd.DataFrame(columns=["weapon_name", "skin_name", "type"])
@@ -434,7 +434,7 @@ def _build_facts(
         null_path = CSV_OUT_DIR / "null_weapons.csv"
         CSV_OUT_DIR.mkdir(parents=True, exist_ok=True)
         null_weapons.to_csv(null_path, index=False)
-        logger.info(f"[facts] Saved {len(null_weapons)} null-weapon rows → {null_path}")
+        logger.info(f"[facts] Saved {len(null_weapons)} null-weapon rows tp {null_path}")
 
     price_all = price_all[price_all["weapon_name"].notna()].copy()
     if price_all.empty:
@@ -454,7 +454,7 @@ def _build_facts(
         price_all["type"] = "Standard"
 
     price_all["item_type_id"] = price_all["type"].map(item_type_map)
-    # Any label not in the map (shouldn't happen, but defensive) → Standard
+    # Any label not in the map (shouldn't happen, but defensive) tp Standard
     standard_id = item_type_map.get("Standard")
     price_all["item_type_id"] = price_all["item_type_id"].fillna(standard_id).apply(
         lambda x: None if pd.isna(x) else int(x)
