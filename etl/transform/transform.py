@@ -26,18 +26,27 @@ def _transform_weapons_items(weapons_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _transform_stickers(stickers_df: pd.DataFrame) -> pd.DataFrame:
-    """Transform stickers DataFrame to required format for loading.
-
-    Input: DataFrame with columns ['name', 'event', 'type']
-    Output: DataFrame with columns ['sticker_name', 'rarity']
-    """
     if stickers_df is None or stickers_df.empty:
-        return pd.DataFrame(columns=['sticker_name', 'rarity'])
+        return pd.DataFrame(columns=["sticker_name", "rarity"])
 
-    result = stickers_df[['name']].copy()
-    result.columns = ['sticker_name']
-    # Use 'type' as rarity if available, otherwise set to 'Unknown'
-    result['rarity'] = stickers_df['type'].fillna('Unknown')
+    print("Sticker columns:", stickers_df.columns.tolist())
+
+    if "name" in stickers_df.columns:
+        name_col = "name"
+    elif "sticker_name" in stickers_df.columns:
+        name_col = "sticker_name"
+    else:
+        raise ValueError(
+            f"Expected 'name' or 'sticker_name'. Found: {stickers_df.columns.tolist()}"
+        )
+
+    result = pd.DataFrame()
+    result["sticker_name"] = stickers_df[name_col]
+
+    if "type" in stickers_df.columns:
+        result["rarity"] = stickers_df["type"].fillna("Unknown")
+    else:
+        result["rarity"] = "Unknown"
 
     return result
 

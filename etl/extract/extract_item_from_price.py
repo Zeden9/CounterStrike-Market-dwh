@@ -71,6 +71,21 @@ def strip_wear(text: str) -> str:
     return _STRIP_WEAR_RE.sub("", text).strip()
 
 
+def detect_item_type(name: str) -> Optional[str]:
+    """Detect if the item is StatTrak, Souvenir, or Standard (None).
+    
+    Returns: "StatTrak", "Souvenir", or None (which represents "Standard")
+    """
+    if not name:
+        return None
+    normalized = name.strip().lstrip("★").strip()
+    if normalized.startswith("StatTrak™") or normalized.startswith("StatTrak"):
+        return "StatTrak"
+    elif normalized.startswith("Souvenir"):
+        return "Souvenir"
+    return None  # Standard
+
+
 # ---------------------------------------------------------------------------
 # Item type detection & parsing
 # ---------------------------------------------------------------------------
@@ -137,12 +152,14 @@ def parse_sticker(name: str) -> Tuple[str, Optional[str], Optional[str]]:
 
 def _parse_glove_row(decoded_name: str) -> dict:
     weapon, skin_name = parse_weapon_name(decoded_name)
-    return {"weapon": weapon, "skin_name": skin_name}
+    item_type = detect_item_type(decoded_name)
+    return {"weapon": weapon, "skin_name": skin_name, "type": item_type}
 
 
 def _parse_sticker_row(decoded_name: str) -> dict:
     sticker_name, event, sticker_type = parse_sticker(decoded_name)
-    return {"name": sticker_name, "event": event, "type": sticker_type}
+    item_type = detect_item_type(decoded_name)
+    return {"sticker_name": sticker_name, "event": event, "rarity": sticker_type, "type": item_type}
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +202,7 @@ def extract_items_from_price(
     gloves_df = (
         pd.DataFrame(gloves_parsed.tolist()).drop_duplicates()
         if not gloves_parsed.empty
-        else pd.DataFrame(columns=["weapon", "skin_name"])
+        else pd.DataFrame(columns=["weapon", "skin_name", "type"])
     )
 
     # ------------------------------------------------------------------
@@ -195,7 +212,7 @@ def extract_items_from_price(
     stickers_df = (
         pd.DataFrame(stickers_parsed.tolist())
         if not stickers_parsed.empty
-        else pd.DataFrame(columns=["name", "event", "type"])
+        else pd.DataFrame(columns=["sticker_name", "event", "rarity", "type"])
     )
 
     # ------------------------------------------------------------------
@@ -215,21 +232,22 @@ def extract_items_from_price(
         if weapon_match is not None:
             weapon_name, weapon_type = weapon_match
             weapon, skin_name = parse_weapon_name(decoded_name)
+            item_type = detect_item_type(decoded_name)
             key = (weapon, skin_name)
 
             if is_knife(weapon_name, weapon_type):
                 if key not in knife_seen:
                     knife_seen.add(key)
-                    knives_records.append({"weapon": weapon, "skin_name": skin_name})
+                    knives_records.append({"weapon": weapon, "skin_name": skin_name, "type": item_type})
             else:
                 if key not in weapon_seen:
                     weapon_seen.add(key)
-                    weapons_records.append({"weapon": weapon, "skin_name": skin_name})
+                    weapons_records.append({"weapon": weapon, "skin_name": skin_name, "type": item_type})
         else:
             unknown_records.append({"name": decoded_name})
 
-    weapons_df = pd.DataFrame(weapons_records) if weapons_records else pd.DataFrame(columns=["weapon", "skin_name"])
-    knives_df = pd.DataFrame(knives_records) if knives_records else pd.DataFrame(columns=["weapon", "skin_name"])
+    weapons_df = pd.DataFrame(weapons_records) if weapons_records else pd.DataFrame(columns=["weapon", "skin_name", "type"])
+    knives_df = pd.DataFrame(knives_records) if knives_records else pd.DataFrame(columns=["weapon", "skin_name", "type"])
     unknown_df = pd.DataFrame(unknown_records) if unknown_records else pd.DataFrame(columns=["name"])
 
     return weapons_df, knives_df, gloves_df, stickers_df, unknown_df

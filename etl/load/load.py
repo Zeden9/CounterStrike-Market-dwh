@@ -32,6 +32,10 @@ logger = get_logger(__name__)
 
 CSV_OUT_DIR = Path("data/processed/to_csv")
 
+# Canonical item types — order is stable, NULL/standard item is represented as None in data
+# but stored as "Standard" in the dimension so every fact row has a non-null FK.
+ITEM_TYPES = ["Standard", "StatTrak", "Souvenir"]
+
 
 # ---------------------------------------------------------------------------
 # CSV save helper
@@ -173,6 +177,27 @@ def _insert_dimension(
 
 
 # ---------------------------------------------------------------------------
+# Item type dimension
+# ---------------------------------------------------------------------------
+
+def _build_item_type_dim() -> pd.DataFrame:
+    """Build Dim_ItemType with the three canonical values."""
+    return pd.DataFrame({"item_type": ITEM_TYPES})
+
+
+def load_item_types(conn, df: pd.DataFrame) -> int:
+    logger.info(f"[dim_itemtype] Loading {len(df)} rows …")
+    return _insert_dimension(conn, "dim_itemtype", df, ["item_type"], "item_type")
+
+
+def _fetch_item_type_map(conn) -> Dict[str, int]:
+    """Return {item_type_label: item_type_id} from the DB."""
+    with conn.cursor() as cur:
+        cur.execute('SELECT item_type_id, item_type FROM "dim_itemtype"')
+        return {row[1]: row[0] for row in cur.fetchall()}
+
+
+# ---------------------------------------------------------------------------
 # Dimension builders
 # ---------------------------------------------------------------------------
 
@@ -187,13 +212,7 @@ def _build_skin_dim(
     skins_df: pd.DataFrame,
     price_frames: Optional[List[pd.DataFrame]] = None,
 ) -> pd.DataFrame:
-    """Build dim_skin from skins.csv plus any skin names seen in price frames.
-
-    skins.csv only contains skins for regular weapons (knives are routed to
-    unknown_skins.csv by extract_weapons). Price frames contain every skin name
-    including knife skins, so we union both sources so knife facts can join.
-    Rarity is unknown for price-frame-only skins and is left as None.
-    """
+    """Build dim_skin from skins.csv plus any skin names seen in price frames."""
     base = skins_df[["skin_name", "rarity"]].drop_duplicates()
 
     if price_frames:
@@ -221,13 +240,7 @@ def _build_weapon_dim(
     taxonomy: Dict[str, str],
     knives_csv_path: str = "data/processed/from_market_data/knives.csv",
 ) -> pd.DataFrame:
-    """Build dim_weapon including knives, with correct weapon_type from taxonomy.
-
-    Sources:
-      1. weapon_name values seen in price data (regular weapons)
-      2. Knife names from knives.csv (knives are not in regular price weapon_name)
-    """
-    # Regular weapons from price frames
+    """Build dim_weapon including knives, with correct weapon_type from taxonomy."""
     all_weapon_names: pd.Series = pd.concat(
         [df["weapon_name"] for df in price_frames if "weapon_name" in df.columns],
         ignore_index=True,
@@ -236,7 +249,6 @@ def _build_weapon_dim(
     weapon_names = sorted(all_weapon_names.unique())
     weapons_df = pd.DataFrame({"weapon_name": weapon_names})
 
-    # Knives from knives.csv
     knives_path = Path(knives_csv_path)
     if knives_path.exists():
         knives_df = pd.read_csv(knives_path)
@@ -250,7 +262,6 @@ def _build_weapon_dim(
         logger.warning(f"Knives CSV not found at {knives_csv_path}; knives skipped from dim_weapon.")
 
     weapons_df = weapons_df.sort_values("weapon_name").reset_index(drop=True)
-    # Do NOT generate weapon_id — Postgres owns the serial PK
     weapons_df["weapon_type"] = weapons_df["weapon_name"].map(taxonomy)
     weapons_df["weapon_type"] = weapons_df["weapon_type"].fillna("Unknown")
 
@@ -297,15 +308,13 @@ def _build_wear_dim(price_frames: List[pd.DataFrame]) -> pd.DataFrame:
 
 def _build_price_range_dim() -> pd.DataFrame:
     price_ranges = [
-        (0,   10,         "0-10"),
-        (10,  50,         "10-50"),
-        (50,  100,        "50-100"),
-        (100, 500,        "100-500"),
+        (0,   10,           "0-10"),
+        (10,  50,           "10-50"),
+        (50,  100,          "50-100"),
+        (100, 500,          "100-500"),
         (500, float("inf"), "500+"),
     ]
-    df = pd.DataFrame(
-        price_ranges, columns=["min_price", "max_price", "price_range"]
-    )
+    df = pd.DataFrame(price_ranges, columns=["min_price", "max_price", "price_range"])
     df["price_range_id"] = df.index + 1
     return df[["price_range_id", "price_range", "min_price", "max_price"]]
 
@@ -375,17 +384,49 @@ def _build_facts(
     skins_db: pd.DataFrame,
     weapons_db: pd.DataFrame,
     wear_db: pd.DataFrame,
+    item_type_map: Dict[str, int],
+    weapons_csv_path: str = "data/processed/from_market_data/weapons.csv",
+    knives_csv_path: str = "data/processed/from_market_data/knives.csv",
+    gloves_csv_path: str = "data/processed/from_market_data/gloves.csv",
 ) -> pd.DataFrame:
     """Build the full fact DataFrame in memory (no DB writes).
 
-    All *_db DataFrames must come from the database (real PKs), never from
-    locally-built dims whose index+1 IDs may not match the Postgres serials.
-    price_range_db must have columns: price_range_id, price_range, min_price, max_price
+    Resolves item_type_id by joining price rows against the type column in the
+    per-category CSVs produced by extract.py (weapons, knives, gloves).
+    None/null type values in those CSVs map to the "Standard" item type.
     """
     if not price_frames or all(df.empty for df in price_frames):
         logger.warning("No price data available for fact building.")
         return pd.DataFrame()
 
+    # ------------------------------------------------------------------
+    # Build a (weapon, skin_name) → item_type lookup from the three CSVs
+    # that now carry a `type` column (StatTrak / Souvenir / None).
+    # ------------------------------------------------------------------
+    type_frames = []
+    for csv_path in (weapons_csv_path, knives_csv_path, gloves_csv_path):
+        p = Path(csv_path)
+        if p.exists():
+            df_csv = pd.read_csv(p)
+            # Both weapons.csv and knives.csv use "weapon"; gloves.csv also uses "weapon"
+            if "weapon" in df_csv.columns and "skin_name" in df_csv.columns and "type" in df_csv.columns:
+                type_frames.append(df_csv[["weapon", "skin_name", "type"]].rename(columns={"weapon": "weapon_name"}))
+        else:
+            logger.warning(f"[facts] CSV not found for item-type lookup: {csv_path}")
+
+    if type_frames:
+        type_lookup = (
+            pd.concat(type_frames, ignore_index=True)
+            .drop_duplicates(subset=["weapon_name", "skin_name"])
+        )
+        # Normalise: None / NaN → "Standard"
+        type_lookup["type"] = type_lookup["type"].fillna("Standard")
+    else:
+        type_lookup = pd.DataFrame(columns=["weapon_name", "skin_name", "type"])
+
+    # ------------------------------------------------------------------
+    # Concat all price frames and basic cleanup
+    # ------------------------------------------------------------------
     price_all = pd.concat(price_frames, ignore_index=True)
 
     null_weapons = price_all[price_all["weapon_name"].isna()]
@@ -403,8 +444,25 @@ def _build_facts(
     price_all["date_parsed"] = _normalize_market_date(price_all["date"])
     price_all["weapon_name"] = price_all["weapon_name"].str.replace("★ ", "", regex=False)
 
+    # ------------------------------------------------------------------
+    # Resolve item_type_id: join on (weapon_name, skin_name), then map to DB id
+    # ------------------------------------------------------------------
+    if not type_lookup.empty:
+        price_all = price_all.merge(type_lookup, on=["weapon_name", "skin_name"], how="left")
+        price_all["type"] = price_all["type"].fillna("Standard")
+    else:
+        price_all["type"] = "Standard"
+
+    price_all["item_type_id"] = price_all["type"].map(item_type_map)
+    # Any label not in the map (shouldn't happen, but defensive) → Standard
+    standard_id = item_type_map.get("Standard")
+    price_all["item_type_id"] = price_all["item_type_id"].fillna(standard_id).apply(
+        lambda x: None if pd.isna(x) else int(x)
+    )
+
+    # ------------------------------------------------------------------
     # Vectorized price range mapping using DB IDs
-    # Use None (not pd.NA) — psycopg2 can only adapt Python None to SQL NULL
+    # ------------------------------------------------------------------
     price_all["price_range_id"] = None
     for _, pr_row in price_range_db.iterrows():
         mask = (price_all["price"] >= pr_row["min_price"]) & (
@@ -428,11 +486,11 @@ def _build_facts(
 
     facts_final = facts[[
         "price", "quantity", "date_id", "skin_id", "weapon_id",
-        "wear_range_id", "price_range_id",
+        "wear_range_id", "price_range_id", "item_type_id",
     ]].copy()
     facts_final.columns = [
         "price", "volume", "date_id", "skin_id", "weapon_id",
-        "wear_range_id", "price_range_id",
+        "wear_range_id", "price_range_id", "item_type_id",
     ]
     facts_final["container_id"] = None
     facts_final["sticker_id"]   = None
@@ -440,19 +498,15 @@ def _build_facts(
     facts_final["match_id"]     = None
 
     # Convert all nullable integer FK columns to object dtype with Python None
-    # so psycopg2 never encounters pd.NA or numpy integers it can't adapt
-    int_fk_cols = ["skin_id", "weapon_id", "wear_range_id", "price_range_id"]
+    int_fk_cols = ["skin_id", "weapon_id", "wear_range_id", "price_range_id", "item_type_id"]
     for col in int_fk_cols:
         facts_final[col] = facts_final[col].apply(
             lambda x: None if pd.isna(x) else int(x)
         )
 
-    # volume may be float after concat — cast to int where present
     facts_final["volume"] = facts_final["volume"].apply(
         lambda x: None if pd.isna(x) else int(x)
     )
-
-    # price must be plain Python float
     facts_final["price"] = facts_final["price"].apply(
         lambda x: None if pd.isna(x) else float(x)
     )
@@ -467,14 +521,11 @@ def _build_facts(
 def load_skins(conn, df: pd.DataFrame) -> int:
     logger.info(f"[dim_skin] Loading {len(df)} rows …")
     columns = ["skin_id", "skin_name", "rarity"] if "skin_id" in df.columns else ["skin_name", "rarity"]
-    # Unique constraint is on skin_name (uq_dim_skin_name), not skin_id
     return _insert_dimension(conn, "dim_skin", df, columns, "skin_name")
 
 
 def load_weapons(conn, df: pd.DataFrame) -> int:
     logger.info(f"[dim_weapon] Loading {len(df)} rows …")
-    # Never pass weapon_id — Postgres owns the serial PK.
-    # ON CONFLICT (weapon_name) DO NOTHING keeps this idempotent.
     return _insert_dimension(conn, "dim_weapon", df, ["weapon_name", "weapon_type"], "weapon_name")
 
 
@@ -513,14 +564,11 @@ def load_stickers(conn, df: pd.DataFrame) -> int:
 
 def load_wear_ranges(conn, df: pd.DataFrame) -> int:
     logger.info(f"[dim_wear_range] Loading {len(df)} rows …")
-    # Never pass wear_range_id — Postgres owns the serial PK.
     return _insert_dimension(conn, "dim_wear_range", df, ["wear_range"], "wear_range")
 
 
 def load_price_ranges(conn, df: pd.DataFrame) -> int:
     logger.info(f"[dim_price_range] Loading {len(df)} rows …")
-    # Never pass price_range_id — Postgres owns the serial PK.
-    # ON CONFLICT (price_range) DO NOTHING keeps this idempotent.
     return _insert_dimension(conn, "dim_price_range", df, ["price_range"], "price_range")
 
 
@@ -534,7 +582,7 @@ def load_facts(conn, facts_final: pd.DataFrame) -> int:
 
     columns = [
         "price", "volume", "date_id", "skin_id", "weapon_id",
-        "wear_range_id", "price_range_id",
+        "wear_range_id", "price_range_id", "item_type_id",
         "container_id", "sticker_id", "team_id", "match_id",
     ]
     col_str = ", ".join(f'"{c}"' for c in columns)
@@ -563,6 +611,8 @@ def load_prices_dimensions(
     max_price_files: Optional[int] = None,
     weapons_txt_path: str = "data/raw/weapons.txt",
     knives_csv_path: str = "data/processed/from_market_data/knives.csv",
+    weapons_csv_path: str = "data/processed/from_market_data/weapons.csv",
+    gloves_csv_path: str = "data/processed/from_market_data/gloves.csv",
     load_to_db: bool = True,
 ) -> None:
     """Build all dimensions and facts, save each to CSV, then (optionally) load to DB."""
@@ -576,23 +626,22 @@ def load_prices_dimensions(
     taxonomy = load_weapon_taxonomy(weapons_txt_path)
 
     # Build all dimensions
+    item_type_dim_df = _build_item_type_dim()
     containers_df    = _build_containers(skins_df, price_frames)
     weapons_dim_df   = _build_weapon_dim(price_frames, taxonomy, knives_csv_path)
     times_dim_df     = _build_time_dim(price_frames)
     wear_dim_df      = _build_wear_dim(price_frames)
     price_range_df   = _build_price_range_dim()
+    skins_dim_df     = _build_skin_dim(skins_df, price_frames)
 
-    # Inline skin dim from skins_df (already loaded into DB by load_all,
-    # but we still want the CSV for reference)
-    skins_dim_df = _build_skin_dim(skins_df, price_frames)
-
-    # Save dimension CSVs (IDs not yet known for weapons — assigned by Postgres)
-    _save_csv(skins_dim_df,   "dim_skin")
-    _save_csv(weapons_dim_df, "dim_weapon")
-    _save_csv(containers_df,  "dim_container")
-    _save_csv(times_dim_df,   "dim_time")
-    _save_csv(wear_dim_df,    "dim_wear_range")
-    _save_csv(price_range_df, "dim_price_range")
+    # Save dimension CSVs
+    _save_csv(item_type_dim_df, "dim_itemtype")
+    _save_csv(skins_dim_df,     "dim_skin")
+    _save_csv(weapons_dim_df,   "dim_weapon")
+    _save_csv(containers_df,    "dim_container")
+    _save_csv(times_dim_df,     "dim_time")
+    _save_csv(wear_dim_df,      "dim_wear_range")
+    _save_csv(price_range_df,   "dim_price_range")
 
     if not load_to_db:
         logger.info("load_to_db=False – skipping database inserts.")
@@ -600,15 +649,16 @@ def load_prices_dimensions(
 
     conn = get_connection()
     try:
-        # Insert dimensions (weapons have no client-side IDs)
+        # Seed Dim_ItemType first — facts depend on its IDs
+        #load_item_types(conn, item_type_dim_df)
+
         load_weapons(conn, weapons_dim_df)
         load_containers(conn, containers_df)
         load_times(conn, times_dim_df)
         load_wear_ranges(conn, wear_dim_df)
         load_price_ranges(conn, price_range_df)
 
-        # Read ALL dimension IDs back from DB — Postgres serials are the source of truth.
-        # Never use locally-generated index+1 IDs for FK columns in facts.
+        # Read ALL dimension IDs back from DB — Postgres serials are source of truth
         with conn.cursor() as cur:
             cur.execute('SELECT skin_id, skin_name FROM "dim_skin"')
             skins_db = pd.DataFrame(cur.fetchall(), columns=["skin_id", "skin_name"])
@@ -619,19 +669,21 @@ def load_prices_dimensions(
             cur.execute('SELECT wear_range_id, wear_range FROM "dim_wear_range"')
             wear_db = pd.DataFrame(cur.fetchall(), columns=["wear_range_id", "wear_range"])
 
-            # price_range needs min/max bounds for the mapping — store them locally
-            # keyed by price_range label so we can join on the DB's real IDs
             cur.execute('SELECT price_range_id, price_range FROM "dim_price_range"')
             pr_db = pd.DataFrame(cur.fetchall(), columns=["price_range_id", "price_range"])
 
-        # Re-attach min/max bounds from the locally-built df (labels are stable)
+        item_type_map = _fetch_item_type_map(conn)
+
         price_range_db = pr_db.merge(
             price_range_df[["price_range", "min_price", "max_price"]],
             on="price_range",
             how="left",
         )
 
-        facts_df = _build_facts(price_frames, price_range_db, skins_db, weapons_db, wear_db)
+        facts_df = _build_facts(
+            price_frames, price_range_db, skins_db, weapons_db, wear_db,
+            item_type_map, weapons_csv_path, knives_csv_path, gloves_csv_path,
+        )
         if not facts_df.empty:
             _save_csv(facts_df, "fact_marketprice")
             load_facts(conn, facts_df)
@@ -646,26 +698,16 @@ def load_all(
     knives_csv_path: str = "data/processed/from_market_data/knives.csv",
     price_frames: Optional[List[pd.DataFrame]] = None,
 ) -> None:
-    """Load the core entity dimensions produced by the transform stage.
-
-    dim_weapon is always built via _build_weapon_dim so weapon_type values
-    come from weapons.txt rather than whatever column name/value the transform
-    stage happens to emit (which historically used "weapon" not "weapon_name"
-    and defaulted every type to "Weapon").
-    """
+    """Load the core entity dimensions produced by the transform stage."""
     taxonomy = load_weapon_taxonomy(weapons_txt_path)
 
-    # Build dim_weapon properly: from price frames (if available) + knives.csv + taxonomy
-    # Falls back to the transformed weapons list when no price frames are provided
     if price_frames:
         weapons_dim = _build_weapon_dim(price_frames, taxonomy, knives_csv_path)
     elif "weapons" in transformed:
-        # Normalise column name: extract_item_from_price uses "weapon", not "weapon_name"
         w_df = transformed["weapons"].copy()
         if "weapon" in w_df.columns and "weapon_name" not in w_df.columns:
             w_df = w_df.rename(columns={"weapon": "weapon_name"})
         w_df["weapon_type"] = w_df["weapon_name"].map(taxonomy).fillna("Unknown")
-        # Append knives
         knives_path = Path(knives_csv_path)
         if knives_path.exists():
             knives_df = pd.read_csv(knives_path)
@@ -684,6 +726,11 @@ def load_all(
 
     conn = get_connection()
     try:
+        # Always seed item types — idempotent due to ON CONFLICT DO NOTHING
+        item_type_dim_df = _build_item_type_dim()
+        _save_csv(item_type_dim_df, "dim_itemtype")
+        load_item_types(conn, item_type_dim_df)
+
         skins_dim = _build_skin_dim(transformed["skins"], price_frames)
         _save_csv(skins_dim, "dim_skin")
         load_skins(conn, skins_dim)
