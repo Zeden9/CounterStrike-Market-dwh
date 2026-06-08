@@ -549,10 +549,11 @@ def load_facts_streaming(
             )
             for frame in batch
         ]
-        facts_batch = pd.concat([c for c in chunks if not c.empty], ignore_index=True)
-        if facts_batch.empty:
+        valid_chunks = [c for c in chunks if c is not None and len(c) > 0]
+        if not valid_chunks:
             logger.info(f"[fact_marketprice] Batch {batch_idx}/{num_batches} — no rows matched, skipping.")
             continue
+        facts_batch = pd.concat(valid_chunks, ignore_index=True)
 
         rows = [tuple(r) for r in facts_batch[columns].itertuples(index=False, name=None)]
 
