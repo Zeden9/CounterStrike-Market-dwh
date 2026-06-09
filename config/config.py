@@ -13,7 +13,7 @@ import os
 DB_CONFIG = {
     "host":     os.getenv("DW_HOST",     "localhost"),
     "port":     int(os.getenv("DW_PORT", "5432")),
-    "dbname":   os.getenv("DW_NAME",     "CSGO_MARKETPLACE"),
+    "dbname":   os.getenv("DW_NAME",     "CSGO_MARKET2"),
     "user":     os.getenv("DW_USER",     "postgres"),
     "password": os.getenv("DW_PASSWORD", "admin"),
 }

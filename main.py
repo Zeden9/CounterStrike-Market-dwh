@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from config.logger import get_logger
 from etl.extract.extract_weapons import extract_all as extract_weapons_all
+from etl.extract.extract_item_from_price import extract_all as extract_items_all
 from etl.extract.extract_prices import extract_prices
 from etl.transform.transform import transform_all
 from etl.load.load import load_all, load_prices_dimensions
@@ -31,6 +32,8 @@ logger = get_logger("pipeline")
 def run_extract(max_price_files: Optional[int] = None):
     logger.info("=== STAGE: EXTRACT ===")
     raw = extract_weapons_all()
+    items = extract_items_all()
+    raw.update(items)
     price_frames = extract_prices(max_files=max_price_files)
     for key, df in raw.items():
         logger.info(f"  {key}: {len(df)} rows extracted.")

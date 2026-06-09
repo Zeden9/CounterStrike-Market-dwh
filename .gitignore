@@ -2,3 +2,4 @@ data/*
 notebooks/*
 logs/*
 *.pyc
+null_weapons_load.csv

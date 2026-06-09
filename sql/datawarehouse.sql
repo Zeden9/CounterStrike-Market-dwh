@@ -1,30 +1,38 @@
--- 1. Dimension Tables (No external dependencies)
-CREATE TABLE Dim_Time (
+-- 1. Dimension Tables
+
+CREATE TABLE dim_time (
     date_id DATE PRIMARY KEY,
     day INT,
     month INT,
     year INT
 );
 
-CREATE TABLE Dim_Skin (
-    skin_id SERIAL PRIMARY KEY, -- Automatically handles SEQUENCE and DEFAULT
-    skin_name VARCHAR(255),
-    rarity VARCHAR(50)
+CREATE TABLE dim_skin_addon (
+    addon_id SERIAL PRIMARY KEY,
+    addon_name VARCHAR(50)
 );
 
-CREATE TABLE Dim_Sticker (
+CREATE TABLE dim_skin (
+    skin_id SERIAL PRIMARY KEY,
+    skin_name VARCHAR(255),
+    rarity VARCHAR(50),
+    addon_id INT,
+    FOREIGN KEY (addon_id) REFERENCES dim_skin_addon(addon_id)
+);
+
+CREATE TABLE dim_sticker (
     sticker_id SERIAL PRIMARY KEY,
     sticker_name VARCHAR(255),
     rarity VARCHAR(50)
 );
 
-CREATE TABLE Dim_Weapon (
+CREATE TABLE dim_weapon (
     weapon_id SERIAL PRIMARY KEY,
     weapon_name VARCHAR(255),
     weapon_type VARCHAR(100)
 );
 
-CREATE TABLE Dim_Container (
+CREATE TABLE dim_container (
     container_id SERIAL PRIMARY KEY,
     container_name VARCHAR(255),
     container_price FLOAT,
@@ -32,43 +40,47 @@ CREATE TABLE Dim_Container (
     container_type VARCHAR(100)
 );
 
-CREATE TABLE Dim_Team (
+CREATE TABLE dim_team (
     team_id SERIAL PRIMARY KEY,
     team_name VARCHAR(255)
 );
 
-CREATE TABLE Dim_Price_range (
+CREATE TABLE dim_price_range (
     price_range_id SERIAL PRIMARY KEY,
     price_range VARCHAR(50)
 );
 
-CREATE TABLE Dim_Wear_range (
+CREATE TABLE dim_wear_range (
     wear_range_id SERIAL PRIMARY KEY,
     wear_range VARCHAR(50)
 );
 
-CREATE TABLE Dim_ItemType (
+CREATE TABLE dim_itemtype (
     item_type_id SERIAL PRIMARY KEY,
     item_type VARCHAR(10)
 );
 
--- 2. Dependent Dimension Tables (Contains Foreign Keys)
-CREATE TABLE Dim_MatchOutcome (
+-- 2. Dependent Dimension Table
+
+CREATE TABLE dim_matchoutcome (
     match_id SERIAL PRIMARY KEY,
     match_date DATE,
     winner_team INT,
     loser_team INT,
-    FOREIGN KEY (winner_team) REFERENCES Dim_Team(team_id),
-    FOREIGN KEY (loser_team) REFERENCES Dim_Team(team_id)
+    FOREIGN KEY (winner_team) REFERENCES dim_team(team_id),
+    FOREIGN KEY (loser_team) REFERENCES dim_team(team_id)
 );
 
 -- 3. Central Fact Table
-CREATE TABLE Fact_MarketPrice (
+
+CREATE TABLE fact_marketprice (
     fact_id SERIAL PRIMARY KEY,
-    item_type INT,
+
+    item_type_id INT NOT NULL,
     price FLOAT,
     volume INT,
-    date_id DATE,
+    date_id DATE NOT NULL,
+
     sticker_id INT,
     team_id INT,
     skin_id INT,
@@ -77,25 +89,23 @@ CREATE TABLE Fact_MarketPrice (
     wear_range_id INT,
     price_range_id INT,
     weapon_id INT,
-    
-    -- Foreign Key Constraints
-    FOREIGN KEY (date_id) REFERENCES Dim_Time(date_id),
-    FOREIGN KEY (sticker_id) REFERENCES Dim_Sticker(sticker_id),
-    FOREIGN KEY (team_id) REFERENCES Dim_Team(team_id),
-    FOREIGN KEY (skin_id) REFERENCES Dim_Skin(skin_id),
-    FOREIGN KEY (container_id) REFERENCES Dim_Container(container_id),
-    FOREIGN KEY (match_id) REFERENCES Dim_MatchOutcome(match_id),
-    FOREIGN KEY (wear_range_id) REFERENCES Dim_Wear_range(wear_range_id),
-    FOREIGN KEY (price_range_id) REFERENCES Dim_Price_range(price_range_id),
-    FOREIGN KEY (weapon_id) REFERENCES Dim_Weapon(weapon_id),
-    FOREIGN KEY (item_type) REFERENCES Dim_ItemType(item_type_id),
 
-    -- Business Rule: Fact record must belong to exactly one structural item category
+    FOREIGN KEY (date_id) REFERENCES dim_time(date_id),
+    FOREIGN KEY (sticker_id) REFERENCES dim_sticker(sticker_id),
+    FOREIGN KEY (team_id) REFERENCES dim_team(team_id),
+    FOREIGN KEY (skin_id) REFERENCES dim_skin(skin_id),
+    FOREIGN KEY (container_id) REFERENCES dim_container(container_id),
+    FOREIGN KEY (match_id) REFERENCES dim_matchoutcome(match_id),
+    FOREIGN KEY (wear_range_id) REFERENCES dim_wear_range(wear_range_id),
+    FOREIGN KEY (price_range_id) REFERENCES dim_price_range(price_range_id),
+    FOREIGN KEY (weapon_id) REFERENCES dim_weapon(weapon_id),
+    FOREIGN KEY (item_type_id) REFERENCES dim_itemtype(item_type_id),
+
+    -- Exactly one of skin, sticker, or container must be populated
     CHECK (
-        (
-            CASE WHEN skin_id IS NOT NULL THEN 1 ELSE 0 END +
-            CASE WHEN sticker_id IS NOT NULL THEN 1 ELSE 0 END +
-            CASE WHEN container_id IS NOT NULL THEN 1 ELSE 0 END
-        ) = 1
+        (CASE WHEN skin_id IS NOT NULL THEN 1 ELSE 0 END) +
+        (CASE WHEN sticker_id IS NOT NULL THEN 1 ELSE 0 END) +
+        (CASE WHEN container_id IS NOT NULL THEN 1 ELSE 0 END)
+        = 1
     )
 );
