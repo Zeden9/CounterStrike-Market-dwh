@@ -70,6 +70,7 @@ FACT_COLUMNS = [
 
 # Canonical price buckets — kept in sync with load.py / _build_price_range_dim()
 PRICE_RANGE_BINS: List[tuple] = [
+
     (1, "0-10",    0,   10),
     (2, "10-50",   10,  50),
     (3, "50-100",  50,  100),
@@ -123,6 +124,8 @@ def _classify_container_type(name: str) -> Optional[str]:
     return None
 
 
+
+
 # ---------------------------------------------------------------------------
 # Discover container price files from data/raw/market/
 # ---------------------------------------------------------------------------
@@ -135,7 +138,9 @@ def _load_container_frames(
 
     price_frames : list of DataFrames, each with at minimum
                    [container_name, price, date]
-    metadata_df  : [container_name, container_type] for dim_container upsert
+    metadata_df  : [container_name, container_type, release_date] for
+                   dim_container upsert.  release_date is the oldest date
+                   found in the container's market CSV.
     """
     market_path = Path(market_dir)
     if not market_path.exists():
@@ -198,11 +203,31 @@ def _load_container_frames(
         logger.warning(f"{len(missing)} container(s) had no matching market CSV.")
     logger.info(f"Loaded {len(price_frames)} container price files.")
 
+    # Derive release_date as the oldest date seen in each container's market data
+    release_date_map: Dict[str, Optional[str]] = {}
+    for frame in price_frames:
+        name = frame["container_name"].iloc[0] if "container_name" in frame.columns and len(frame) > 0 else None
+        if name is None:
+            continue
+        dates = _normalize_market_date(frame["date"]) if "date" in frame.columns else pd.Series(dtype="datetime64[ns]")
+        oldest = dates.dropna().min()
+        if pd.notna(oldest):
+            existing = release_date_map.get(name)
+            candidate = oldest.strftime("%Y-%m-%d")
+            if existing is None or candidate < existing:
+                release_date_map[name] = candidate
+
     metadata_df = (
         container_rows[["decoded", "container_type"]]
         .drop_duplicates()
         .rename(columns={"decoded": "container_name"})
-        .assign(container_price=None, release_date=None)
+        .assign(container_price=None)
+    )
+    metadata_df["release_date"] = metadata_df["container_name"].map(release_date_map)
+
+    logger.info(
+        f"[load_containers] Release dates derived from market data: "
+        f"{metadata_df['release_date'].notna().sum()}/{len(metadata_df)} containers resolved."
     )
 
     return price_frames, metadata_df
@@ -245,8 +270,8 @@ def _upsert_container_metadata(conn, df: pd.DataFrame) -> int:
         VALUES %s
         ON CONFLICT (container_name) DO UPDATE
             SET container_price = EXCLUDED.container_price,
-                release_date    = EXCLUDED.release_date,
-                container_type  = EXCLUDED.container_type
+                release_date    = COALESCE(EXCLUDED.release_date, "dim_container".release_date),
+                container_type  = COALESCE(EXCLUDED.container_type, "dim_container".container_type)
     """
     with conn.cursor() as cur:
         execute_values(cur, sql, rows, page_size=500)
@@ -495,7 +520,7 @@ def load_container_dimensions(
     conversion_table_path: str = "data/raw/name_conversion_table.csv",
     price_frames: Optional[List[pd.DataFrame]] = None,
     save_csv: bool = True,
-    load_to_db: bool = False,
+    load_to_db: bool = True,
     batch_size: int = 50,
 ) -> None:
     """Full container ETL: upsert dim_container, then stream facts into fact_marketprice.
@@ -536,10 +561,23 @@ def load_container_dimensions(
             .dropna()
             .unique()
         )
+        release_date_map: Dict[str, Optional[str]] = {}
+        for frame in price_frames:
+            name = frame["container_name"].iloc[0] if "container_name" in frame.columns and len(frame) > 0 else None
+            if name is None:
+                continue
+            dates = _normalize_market_date(frame["date"]) if "date" in frame.columns else pd.Series(dtype="datetime64[ns]")
+            oldest = dates.dropna().min()
+            if pd.notna(oldest):
+                existing = release_date_map.get(name)
+                candidate = oldest.strftime("%Y-%m-%d")
+                if existing is None or candidate < existing:
+                    release_date_map[name] = candidate
+
         metadata_df = pd.DataFrame({
             "container_name":  names,
             "container_price": None,
-            "release_date":    None,
+            "release_date":    [release_date_map.get(n) for n in names],
             "container_type":  [_classify_container_type(n) for n in names],
         })
 
