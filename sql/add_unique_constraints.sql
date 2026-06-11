@@ -11,3 +11,6 @@ ALTER TABLE Dim_Weapon
 
 ALTER TABLE Dim_Sticker
     ADD CONSTRAINT uq_dim_sticker_name UNIQUE (sticker_name);
+
+ALTER TABLE Dim_Container
+    ADD CONSTRAINT uq_dim_container_name UNIQUE (container_name);

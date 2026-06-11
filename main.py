@@ -1,7 +1,7 @@
 """
 main.py  –  ETL Pipeline Entry Point
 -------------------------------------
-Run the full pipeline:
+Run the full pipeline (extract → transform → load → analysis):
     python main.py
 
 Or run individual stages via flags:
@@ -9,6 +9,10 @@ Or run individual stages via flags:
     python main.py --stage transform
     python main.py --stage load
     python main.py --dry-run        # Extract + Transform only, no DB writes
+    python main.py --no-analysis    # Run full pipeline but skip chart generation
+
+Run analysis independently:
+    python Analysis/graphs.py       # Generate charts from existing DW data
 """
 
 import argparse
@@ -25,6 +29,8 @@ from etl.extract.extract_item_from_price import extract_all as extract_items_all
 from etl.extract.extract_prices import extract_prices
 from etl.transform.transform import transform_all
 from etl.load.load import load_all, load_prices_dimensions
+from etl.load.load_containers import load_container_dimensions
+
 
 logger = get_logger("pipeline")
 
@@ -53,10 +59,31 @@ def run_load(transformed):
     logger.info("=== STAGE: LOAD ===")
     load_all(transformed)
     load_prices_dimensions(price_frames=transformed.get("prices"))
+    # load_container_dimensions discovers container files from data/raw/market/
+    # and loads them into dim_container and fact_marketprice
+    load_container_dimensions(
+        save_csv=True,
+        load_to_db=True,
+    )
+
+
+def run_analysis():
+    """Generate analysis charts from the loaded data warehouse."""
+    logger.info("=== STAGE: ANALYSIS ===")
+    try:
+        # Import here to avoid dependency if user only wants ETL
+        from Analysis.graphs import main as graphs_main
+        graphs_main()
+        logger.info("Analysis charts generated successfully.")
+    except ImportError as e:
+        logger.warning(f"Could not import Analysis.graphs: {e}")
+    except Exception as e:
+        logger.error(f"Analysis stage failed: {e}")
+        raise
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CS Skin DW – ETL pipeline")
+    parser = argparse.ArgumentParser(description="CS Skin DW – ETL pipeline + Analysis")
     parser.add_argument(
         "--stage",
         choices=["extract", "transform", "load", "all"],
@@ -67,6 +94,11 @@ def main():
         "--dry-run",
         action="store_true",
         help="Run Extract + Transform only; skip loading into the DB.",
+    )
+    parser.add_argument(
+        "--no-analysis",
+        action="store_true",
+        help="Skip analysis/chart generation after loading.",
     )
     args = parser.parse_args()
 
@@ -88,6 +120,10 @@ def main():
 
         if args.stage in ("load", "all"):
             run_load(transformed)
+
+        # Run analysis after successful load
+        if args.stage in ("load", "all") and not args.no_analysis:
+            run_analysis()
 
         logger.info("Pipeline finished successfully.")
 

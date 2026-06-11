@@ -202,12 +202,35 @@ SQL["top10_weapons"] = """
     SELECT
         dw.weapon_name,
         AVG(f.price) AS avg_price
-    FROM  fact_marketprice f
-    JOIN  dim_weapon        dw ON dw.weapon_id = f.weapon_id
+    FROM fact_marketprice f
+    JOIN dim_weapon dw
+        ON dw.weapon_id = f.weapon_id
     WHERE f.price IS NOT NULL
-    GROUP BY 1
+        AND dw.weapon_name NOT LIKE '%StatTrak%'
+        AND dw.weapon_name NOT LIKE '%Gloves%'
+        AND dw.weapon_name NOT LIKE '%Wraps%'
+        AND dw.weapon_name NOT LIKE '%Souvenir%'
+    GROUP BY dw.weapon_name
     ORDER BY avg_price DESC
-    LIMIT 10
+    LIMIT 10;
+"""
+
+SQL["top10_weapons_no_gloves_knives"] = """
+    SELECT
+        dw.weapon_name,
+        AVG(f.price) AS avg_price
+    FROM fact_marketprice f
+    JOIN dim_weapon dw
+        ON dw.weapon_id = f.weapon_id
+    WHERE f.price IS NOT NULL
+        AND dw.weapon_name NOT LIKE '%StatTrak%'
+        AND dw.weapon_name NOT LIKE '%Gloves%'
+        AND dw.weapon_name NOT LIKE '%Wraps%'
+        AND dw.weapon_name NOT LIKE '%Souvenir%'
+        AND dw.weapon_type != 'Knife'
+    GROUP BY dw.weapon_name
+    ORDER BY avg_price DESC
+    LIMIT 10;
 """
 
 SQL["heatmap"] = """
@@ -254,6 +277,7 @@ def main():
     wear_price     = q(conn, SQL["wear_price"],        "wear price")
     weapon_bubble  = q(conn, SQL["weapon_bubble"],     "weapon bubble")
     top10          = q(conn, SQL["top10_weapons"],     "top 10 weapons")
+    top10_filtered = q(conn, SQL["top10_weapons_no_gloves_knives"], "top 10 weapons (no gloves/knives)")
     heatmap_df     = q(conn, SQL["heatmap"],           "rarity×wear heatmap")
 
     has_container = False
@@ -297,7 +321,7 @@ def main():
 
     # ① price trend by rarity ─────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(14, 6), facecolor=BG)
-    style_ax(ax, "① Average Skin Price Over Time — Grouped by Rarity", ylabel="Avg Price (USD)")
+    style_ax(ax, "Average Skin Price Over Time — Grouped by Rarity", ylabel="Avg Price (USD)")
     if not rarity_trend.empty:
         # ── FIX: use utc=True then strip tz ──────────────────────────────────
         rarity_trend["month"] = to_dt(rarity_trend["month"])
@@ -315,7 +339,7 @@ def main():
   # ① price trend by rarity without contraband ─────────────────────────────────────────────────
   
     fig, ax = plt.subplots(figsize=(14, 6), facecolor=BG)
-    style_ax(ax, "① Average Skin Price Over Time — Grouped by Rarity", ylabel="Avg Price (USD)")
+    style_ax(ax, "Average Skin Price Over Time — Grouped by Rarity", ylabel="Avg Price (USD)")
     if not rarity_trend.empty:
         # ── FIX: use utc=True then strip tz ──────────────────────────────────
         rarity_trend["month"] = to_dt(rarity_trend["month"])
@@ -332,7 +356,7 @@ def main():
 
     # ② monthly volume ────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 5), facecolor=BG)
-    style_ax(ax, "② Monthly Trade Volume", ylabel="Units Sold")
+    style_ax(ax, "Monthly Trade Volume", ylabel="Units Sold")
     if not monthly_volume.empty:
         # ── FIX: use utc=True then strip tz ──────────────────────────────────
         monthly_volume["month"] = to_dt(monthly_volume["month"])
@@ -348,7 +372,7 @@ def main():
 
     # ③ volume vs revenue share ───────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(12, 5), facecolor=BG)
-    style_ax(ax, "③ Volume Share vs Revenue Share — by Rarity", ylabel="Share (%)")
+    style_ax(ax, "Volume Share vs Revenue Share — by Rarity", ylabel="Share (%)")
     if not rs.empty:
         labels3 = rs["rarity"].tolist()
         x3  = np.arange(len(labels3))
@@ -369,7 +393,7 @@ def main():
     # ④ price range pie ───────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(8, 7), facecolor=BG)
     ax.set_facecolor(PANEL)
-    ax.set_title("④ Listing Price-Range Distribution",
+    ax.set_title("Listing Price-Range Distribution",
                  color=TEXT, fontsize=13, fontweight="bold", pad=12)
     if not price_range_df.empty:
         pie_c = [BLUE, GREEN, GOLD, ORANGE, PURPLE, RED][:len(price_range_df)]
@@ -384,7 +408,7 @@ def main():
 
     # ⑤ avg price per wear ────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(9, 5), facecolor=BG)
-    style_ax(ax, "⑤ Avg Price by Wear Condition", xlabel="Avg Price (USD)")
+    style_ax(ax, "Avg Price by Wear Condition", xlabel="Avg Price (USD)")
     if not wear_price.empty:
         wp = wear_price.copy()
         order = [w for w in WEAR_ORDER if w in wp["wear"].values]
@@ -401,7 +425,7 @@ def main():
 
     # ⑥ weapon bubble chart ───────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 6), facecolor=BG)
-    style_ax(ax, "⑥ Weapon Type — Volume vs Avg Price",
+    style_ax(ax, "Weapon Type — Volume vs Avg Price",
              xlabel="Total Volume", ylabel="Avg Price (USD)")
     if not weapon_bubble.empty:
         wb = weapon_bubble[
@@ -427,7 +451,7 @@ def main():
 
     # ⑦ top 10 weapons ────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 6), facecolor=BG)
-    style_ax(ax, "⑦ Top 10 Items by Avg Listing Price", xlabel="Avg Price (USD)")
+    style_ax(ax, "Top 10 Items by Avg Listing Price", xlabel="Avg Price (USD)")
     if not top10.empty:
         names7  = top10["weapon_name"].tolist()
         prices7 = top10["avg_price"].tolist()
@@ -442,21 +466,12 @@ def main():
                     f"${val:,.0f}", va="center", color=TEXT, fontsize=9)
         ax.set_xlim(0, max(prices7) * 1.2)
         ax.tick_params(axis="y", labelsize=9, colors=TEXT)
-        ax.legend(handles=[mpatches.Patch(color=GOLD, label="Knife / Gloves"),
-                            mpatches.Patch(color=BLUE, label="Standard weapon")],
-                  fontsize=8.5, facecolor=PANEL, edgecolor=BORDER, labelcolor=TEXT,
-                  loc="lower right")
     save(fig, "07_top10_weapons.png")
     # ⑦ top 10 weapons, no knives or gloves ────────────────────────────────────────────────────────
   
     fig, ax = plt.subplots(figsize=(10, 6), facecolor=BG)
-    style_ax(ax, "⑦ Top 10 Items by Avg Listing Price (excl. Knives & Gloves)", xlabel="Avg Price (USD)")
-    if not top10.empty:
-        top10_filtered = top10[~top10["weapon_name"].str.contains(
-            "Knife|Glove|Karambit|Butterfly|Bayonet|Flip|Falchion|Shadow|"
-            "Navaja|Stiletto|Ursus|Talon|Skeleton|Nomad|Paracord|Survival|★|Wraps|StatTrack|Souvenir",
-            case=False, na=False
-        )].head(10)
+    style_ax(ax, "Top 10 Items by Avg Listing Price (excl. Knives & Gloves)", xlabel="Avg Price (USD)")
+    if not top10_filtered.empty:
         names7  = top10_filtered["weapon_name"].tolist()
         prices7 = top10_filtered["avg_price"].tolist()
         bars7 = ax.barh(names7[::-1], prices7[::-1], color=BLUE,
@@ -466,17 +481,20 @@ def main():
                     f"${val:,.0f}", va="center", color=TEXT, fontsize=9)
         ax.set_xlim(0, max(prices7) * 1.2)
         ax.tick_params(axis="y", labelsize=9, colors=TEXT)
+    else:
+        ax.text(0.5, 0.5, "No data available", ha="center", va="center",
+                color=SUB, fontsize=11, transform=ax.transAxes)
     save(fig, "07_top10_weapons_filtered.png")
 
     # ⑧ container age scatter (optional) ──────────────────────────────────────
     fig, ax = plt.subplots(figsize=(12, 5), facecolor=BG)
-    style_ax(ax,
-             "⑧ Container Age vs Average Skin Price Multiplier" +
+    style_ax(ax, "Container Age vs Average Skin Price Multiplier" +
              ("  (no container data)" if not has_container else ""),
              xlabel="Days Since Release", ylabel="Price Multiplier")
+    ax.set_yscale("log")
     if has_container and not container_df.empty:
-        ctype_c = {"Weapon Case": GOLD, "Souvenir Package": PURPLE,
-                   "Capsule": BLUE, "Sticker Capsule": GREEN}
+        ctype_c = {"Case": GOLD, "Souvenir Package": PURPLE,
+                   "Package": BLUE}
         for ctype, grp in container_df.groupby("container_type"):
             ax.scatter(grp["age_days"], grp["multiplier"],
                        color=ctype_c.get(ctype, SUB), s=55, alpha=0.8,
@@ -499,7 +517,7 @@ def main():
     # ⑨ rarity × wear heatmap ─────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(9, 6), facecolor=BG)
     ax.set_facecolor(PANEL)
-    ax.set_title("⑨ Avg Price Heatmap — Rarity × Wear",
+    ax.set_title("Avg Price Heatmap — Rarity × Wear",
                  color=TEXT, fontsize=13, fontweight="bold", pad=12)
     if not pivot.empty:
         im = ax.imshow(pivot.values, cmap="YlOrRd", aspect="auto")
@@ -528,7 +546,7 @@ def main():
     
     fig, ax = plt.subplots(figsize=(9, 6), facecolor=BG)
     ax.set_facecolor(PANEL)
-    ax.set_title("⑨ Avg Price Heatmap — Rarity × Wear",
+    ax.set_title("Avg Price Heatmap — Rarity × Wear",
                  color=TEXT, fontsize=13, fontweight="bold", pad=12)
     pivot_no_contraband = pivot.drop(index="Contraband", errors="ignore")
     if not pivot_no_contraband.empty:
