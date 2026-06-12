@@ -28,6 +28,7 @@ from etl.extract.extract_weapons import extract_all as extract_weapons_all
 from etl.extract.extract_item_from_price import extract_all as extract_items_all
 from etl.extract.extract_prices import extract_prices
 from etl.transform.transform import transform_all
+from etl.transform.post_load_transform import run_post_load_transform
 from etl.load.load import load_all, load_prices_dimensions
 from etl.load.load_containers import load_container_dimensions
 
@@ -120,6 +121,7 @@ def main():
 
         if args.stage in ("load", "all"):
             run_load(transformed)
+            run_post_load_transform()
 
         # Run analysis after successful load
         if args.stage in ("load", "all") and not args.no_analysis:

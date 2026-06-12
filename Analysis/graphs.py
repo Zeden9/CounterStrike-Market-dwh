@@ -261,6 +261,17 @@ SQL["container_age"] = """
     HAVING COUNT(*) >= 10
 """
 
+SQL["item_type_price"] = """
+    SELECT
+        di.item_type,
+        AVG(f.price) AS avg_price
+    FROM fact_marketprice f
+    JOIN dim_itemtype di ON di.item_type_id = f.item_type_id
+    WHERE f.price IS NOT NULL
+    GROUP BY di.item_type
+    ORDER BY avg_price DESC
+"""
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -279,6 +290,7 @@ def main():
     top10          = q(conn, SQL["top10_weapons"],     "top 10 weapons")
     top10_filtered = q(conn, SQL["top10_weapons_no_gloves_knives"], "top 10 weapons (no gloves/knives)")
     heatmap_df     = q(conn, SQL["heatmap"],           "rarity×wear heatmap")
+    item_type_df   = q(conn, SQL["item_type_price"],   "item type distribution")
 
     has_container = False
     container_df  = pd.DataFrame()
@@ -572,6 +584,23 @@ def main():
         cb.ax.yaxis.set_tick_params(color=SUB, labelsize=7.5)
         cb.ax.set_ylabel("Avg USD", color=SUB, fontsize=8)
     save(fig, "09_heatmap_no_contraband.png")
+
+    # ⑩ Avg Price by Item Type ────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 5), facecolor=BG)
+    style_ax(ax, "Average Price by Item Type", xlabel="Avg Price (USD)")
+    if not item_type_df.empty:
+        # Sort so highest price is at the top
+        it_df = item_type_df.sort_values("avg_price", ascending=True)
+        bars = ax.barh(it_df["item_type"], it_df["avg_price"], 
+                       color=[GOLD, BLUE, PURPLE], edgecolor=BG, height=0.5)
+        
+        for bar, val in zip(bars, it_df["avg_price"]):
+            ax.text(val * 1.01, bar.get_y() + bar.get_height()/2,
+                    f"${val:,.0f}", va="center", color=TEXT, fontsize=9)
+        
+        ax.set_xlim(0, it_df["avg_price"].max() * 1.2)
+        ax.tick_params(axis="y", labelsize=9, colors=TEXT)
+    save(fig, "10_item_type_price.png")
 
     print(f"\n  All charts saved to: {os.path.abspath(OUTPUT_DIR)}/\n")
 
